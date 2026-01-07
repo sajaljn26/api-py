@@ -1,8 +1,16 @@
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, File, UploadFile, Form
 from app.schema import PostCreate
-from app.db import create_db_and_tables, get_async_session
+from app.db import create_db_and_tables, get_async_session, Post
 from sqlalchemy.ext.asyncio import AsyncSession
 from contextlib import asynccontextmanager
+from sqlalchemy import select
+from app.images import imagekit
+from imagekitio.models.UploadFileRequestOptions import UploadFileRequestOptions
+import shutil
+import os
+import uuid
+import tempfile
+
 
 
 @asynccontextmanager
@@ -15,24 +23,67 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    caption: str = Form(...),
+    session : AsyncSession = Depends(get_async_session)
+):
 
-text_posts = {"1": {"title": "New posts", "content": "Content of the post"}}
+    temp_file_path = None
 
-@app.get("/posts")
-def get_all_posts():
-    return text_posts
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[1]) as temp_file:
+            temp_file_path = temp_file.name
+            shutil.copyfileobj(file.file, temp_file)
+            
+        upload_result = imagekit.upload_file(
+            file=open(temp_file_path, "rb"),
+            file_name=file.filename,
+            options=UploadFileRequestOptions(
+                use_unique_file_name=True,
+                tags=["backend-upload"]
+            )
+        )
+        
+        if upload_result.response_metadata.http_status_code == 200:
+            post = Post(
+                caption=caption,
+                url=upload_result.url,
+                file_type="video" if file.content_type.startswith("video") else "image"
+            )
+            session.add(post)
+            await session.commit()
+            await session.refresh(post)
+            return post
+        else:
+            raise HTTPException(status_code=500, detail="Upload failed")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.unlink(temp_file_path)
+        file.file.close()
 
-@app.get("/posts/{id}")
-def get_post_by_id(id: str):
-    if id not in text_posts:
-        raise HTTPException(status_code=404, detail="Post not found")  
-    return text_posts.get(id)
 
+@app.get("/feed")
+async def get_feed(
+    session: AsyncSession = Depends(get_async_session)
+):
+    result = await session.execute(select(Post).order_by(Post.created_at.desc()))
+    posts = result.scalars().all()
+    
+    post_data = []
+    for post in posts:
+        post_data.append(
+            {
+                "id": str(post.id),
+                "caption": post.caption,
+                "url": post.url,
+                "file_type": post.file_type,
+                "created_at": post.created_at.isoformat()
+            }
+        )
+    
+    return post_data
 
-@app.post("/posts")
-def create_post(post: PostCreate):
-    new_post = {"title": post.title, "content": post.content}
-    # Generate next ID as string
-    next_id = str(int(max(text_posts.keys())) + 1)
-    text_posts[next_id] = new_post
-    return {"id": next_id, **new_post}

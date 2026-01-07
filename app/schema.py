@@ -4,3 +4,4 @@ class PostCreate(BaseModel):
     title: str
     content: str
 
+
